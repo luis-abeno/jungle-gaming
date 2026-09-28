@@ -1,0 +1,131 @@
+name: wallet
+
+x-wallet-env: &wallet-env
+  DATABASE_URL: postgres://wallet_app:wallet_app@postgres:5432/wallet?sslmode=disable
+  MIGRATION_DATABASE_URL: postgres://wallet:wallet@postgres:5432/wallet?sslmode=disable
+  OIDC_ISSUER: http://keycloak:8080/realms/wallet
+  OIDC_JWKS_URL: http://keycloak:8080/realms/wallet/protocol/openid-connect/certs
+  OIDC_AUDIENCE: wallet-api
+  AWS_REGION: us-east-1
+  AWS_ENDPOINT_URL: http://ministack:4566
+  AWS_ACCESS_KEY_ID: wallet-service
+  AWS_SECRET_ACCESS_KEY: wallet-service-secret
+  SQS_ALLOWED_SENDERS: "000000000000=*"
+  LOG_LEVEL: info
+
+x-wallet: &wallet
+  build: .
+  environment: *wallet-env
+  stop_grace_period: 30s
+  depends_on:
+    migrate:
+      condition: service_completed_successfully
+    provision:
+      condition: service_completed_successfully
+    keycloak:
+      condition: service_healthy
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: wallet
+      POSTGRES_USER: wallet
+      POSTGRES_PASSWORD: wallet
+    command: ["postgres", "-c", "max_connections=300"]
+    volumes:
+      - ./deploy/postgres/init.sql:/docker-entrypoint-initdb.d/10-app-role.sql:ro
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "${POSTGRES_PORT:-55432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U wallet -d wallet"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.4
+    command: ["start-dev", "--import-realm"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: admin
+      KC_HEALTH_ENABLED: "true"
+      KC_HOSTNAME: http://keycloak:8080
+      KC_HOSTNAME_BACKCHANNEL_DYNAMIC: "true"
+    volumes:
+      - ./deploy/keycloak/wallet-realm.json:/opt/keycloak/data/import/wallet-realm.json:ro
+    ports:
+      - "${KEYCLOAK_PORT:-8180}:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/9000 && printf 'GET /health/ready HTTP/1.0\\r\\n\\r\\n' >&3 && grep -q '\"UP\"' <&3"]
+      interval: 5s
+      timeout: 5s
+      retries: 40
+
+  ministack:
+    image: ministackorg/ministack:1.5.17
+    ports:
+      - "${MINISTACK_PORT:-4566}:4566"
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:4566/_ministack/health')"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  migrate:
+    build: .
+    command: ["migrate", "up"]
+    environment: *wallet-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  provision:
+    build: .
+    command: ["provision"]
+    environment: *wallet-env
+    depends_on:
+      ministack:
+        condition: service_healthy
+
+  wallet-1:
+    <<: *wallet
+    ports:
+      - "${WALLET_1_PORT:-8081}:8080"
+  wallet-2:
+    <<: *wallet
+    ports:
+      - "${WALLET_2_PORT:-8082}:8080"
+  wallet-3:
+    <<: *wallet
+    ports:
+      - "${WALLET_3_PORT:-8083}:8080"
+
+  tests:
+    profiles: ["test"]
+    image: golang:1.25.14
+    working_dir: /src
+    command: ["sh", "-c", "go vet ./... && go test -race ./... && go test -race -tags integration -count=1 ./test/integration/..."]
+    environment:
+      GOTOOLCHAIN: local
+      GOFLAGS: -buildvcs=false
+      IT_PG_HOST: postgres:5432
+      IT_KEYCLOAK_URL: http://keycloak:8080
+      IT_SQS_ENDPOINT: http://ministack:4566
+    volumes:
+      - .:/src
+      - gocache:/root/.cache/go-build
+      - gomod:/go/pkg/mod
+    depends_on:
+      postgres:
+        condition: service_healthy
+      keycloak:
+        condition: service_healthy
+      ministack:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+  gocache:
+  gomod:
